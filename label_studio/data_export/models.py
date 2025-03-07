@@ -136,7 +136,8 @@ class DataExport(object):
         for format, format_info in converter.all_formats().items():
             format_info = deepcopy(format_info)
             format_info['name'] = format.name
-            if format.name not in supported_formats:
+            # Exclude COCO from the target list
+            if format.name not in supported_formats and format.name != 'COCO':
                 format_info['disabled'] = True
             formats.append(format_info)
         return sorted(formats, key=lambda f: f.get('disabled', False))
