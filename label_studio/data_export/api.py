@@ -10,6 +10,8 @@ from core.feature_flags import flag_set
 from core.permissions import all_permissions
 from core.redis import start_job_async_or_sync
 from core.utils.common import batch
+from data_export import sensyn_patch_export, upload_export_data_to_blob
+from data_export.json_conversion import possible_categories
 from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import FileSystemStorage
@@ -203,14 +205,56 @@ class ExportAPI(generics.RetrieveAPIView):
             ).data
         logger.debug('Prepare export files')
 
-        export_file, content_type, filename = DataExport.generate_export_file(
-            project, tasks, export_type, download_resources, request.GET, hostname=request.build_absolute_uri('/')
+        is_segmentation_task = any(
+            result['type'] in possible_categories
+            for task in tasks
+            for annotation in task['annotations']
+            for result in annotation['result']
         )
+
+        if export_type == 'COCO':
+            if is_segmentation_task:
+                export_file, content_type, filename = sensyn_patch_export.generate_export_file_for_coco(
+                    project, tasks, export_type, download_resources, request.GET
+                )
+            else:
+                export_file, content_type, filename = DataExport.generate_export_file(
+                    project, tasks, export_type, download_resources, request.GET
+                )
+                # DataExport.generate_export_file will return a zip file, so extract the JSON file from it
+                export_file, content_type, filename = sensyn_patch_export.get_json_str_from_zip(
+                    export_file, filename
+                )
+
+            # Format the converted COCO data"
+            export_file = sensyn_patch_export.format_coco(export_file)
+            
+            # Reset the file pointer to the biginning
+            export_file.seek(0)
+            
+            # Read the file for Blob upload
+            if hasattr(export_file, 'getvalue'):
+                blob_data = export_file.getvalue()
+            else:
+                blob_data = export_file.read()
+                export_file.seek(0)  # Reset the file pointer to the biginning
+                
+            try:
+                upload_export_data_to_blob.upload(project, blob_data, content_type, filename)
+            except Exception as e:
+                logger.error(f"Blob upload failed: {str(e)}")
+        else:
+            export_file, content_type, filename = DataExport.generate_export_file(
+                project, tasks, export_type, download_resources, request.GET, hostname=request.build_absolute_uri('/')
+            )
+
+        # Ensure the file pointer is at the beginning before creating the final response
+        if hasattr(export_file, 'seek'):
+            export_file.seek(0)
 
         r = FileResponse(export_file, as_attachment=True, content_type=content_type, filename=filename)
         r['filename'] = filename
         return r
-
 
 @method_decorator(
     name='get',
@@ -356,7 +400,10 @@ class ExportListAPI(generics.ListCreateAPIView):
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
 
-        return queryset.order_by('-created_at')[:100]
+        if flag_set('fflag_fix_back_lsdv_4929_limit_exports_10042023_short', user='auto'):
+            return queryset.order_by('-created_at')[:100]
+        else:
+            return queryset
 
 
 @method_decorator(
